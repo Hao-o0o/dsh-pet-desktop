@@ -1,0 +1,29 @@
+# Test screenshots / diagnostics (root-level only)
+/badge_test.png
+/badge2.png
+/diag2.png
+/diag3.png
+/final_badge.png
+/fresh.png
+/menu_shot.png
+/phase_badge.png
+/phase2.png
+/phase3.png
+/play_panel.png
+/tool_badge.png
+/e2e_*.png
+/shot*.png
+
+# Windows shortcut (machine-specific paths)
+*.lnk
+
+# Runtime config (machine-specific, created on first run)
+config.json
+
+# Logs
+logs/
+*.log
+
+# Build artifacts
+bin/
+obj/
