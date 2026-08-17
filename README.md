@@ -74,18 +74,26 @@
 - 动画轨道与 dsh-pet 插件共用同一精灵表契约
   （8 列 × 9 行、192×208 单元、1536×1872），帧定义见 `Pet.cs` 的 `TRACKS`
 
-## DSH 网页宠物联动（HTTP API）
+## DSH 网页宠物联动（双通道）
 
-宠物内置本地 HTTP 服务（`127.0.0.1:18787`，无权限要求），
-dsh-pet 插件的网页宠物在动画变化时自动推送到这里，两个宠物同步表演。
+宠物通过**两条通道**获取 DSH 状态，任一可用即可同步：
+
+1. **轮询 DSH host**（主通道，推荐）：Pet 每 2 秒读取
+   `http://127.0.0.1:3080/api/pet/state`（dsh-pet 插件的官方状态端点），
+   解析 animation / phase / bubble 驱动动画与徽章。**不依赖浏览器页面
+   是否打开**，也**不依赖本地推送端口**——3080 是 DSH 服务本身，占用即
+   服务不可用，不存在"端口被其他程序抢走"的问题。
+2. **本地 HTTP 推送**（即时通道）：保留 `127.0.0.1:18787`，dsh-pet 网页
+   宠物动画变化时推送（带 phase 与工具名），比轮询更即时；该端口被占
+   时轮询通道兜底，功能不受影响。
 
 | 端点 | 说明 |
 | --- | --- |
 | `GET /health` | 存活检查：`{"ok":true,"track":"idle","pid":...}` |
 | `GET /state` | 当前状态：track / row / frame / clickThrough / visible / sizePct / moveEnabled / moveSpeed |
-| `GET /play?track=jumping` | 播放指定动画（9 轨全支持） |
+| `GET /play?track=jumping&phase=done&label=...` | 推送播放指定动画（9 轨全支持）+ 状态徽章信息 |
 | `GET /config?clickthrough=1&sizePct=75&move=1&speed=120` | 远程切换全部设置 |
-| `GET /menu?sub=size` | 远程唤起 Controller 面板（sub: size/speed） |
+| `GET /menu?sub=size` | 远程唤起 Controller 面板（sub: size/speed/play/idle） |
 
 浏览器直接 `fetch` 即可（CORS 已放开）。
 

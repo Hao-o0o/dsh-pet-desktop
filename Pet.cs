@@ -272,6 +272,7 @@ namespace DshPetDesktop
             PlayTrack(0);
             _timer.Start();
             StartHttpServer();
+            StartDshPoll();
             ApplyControllerState();
         }
 
@@ -283,6 +284,11 @@ namespace DshPetDesktop
 
         [DllImport("user32.dll", EntryPoint = "SetWindowLongW")]
         private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+        private const uint HANDLE_FLAG_INHERIT = 0x1;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetHandleInformation(IntPtr hObject, uint dwMask, uint dwFlags);
 
         protected override void OnSourceInitialized(EventArgs e)
         {
@@ -663,18 +669,28 @@ namespace DshPetDesktop
         private void ShowBadgeWindow()
         {
             if (_badgeWin == null) return;
+            // The auto-hide path collapsed the badge content; restore it so a
+            // later state change can pop the badge up again.
+            if (_statusBadge != null && _statusBadge.Visibility != Visibility.Visible)
+            {
+                _statusBadge.Visibility = Visibility.Visible;
+                _statusBadge.UpdateLayout();
+            }
             if (_visible && _badgeWin.Visibility != Visibility.Visible)
             {
                 _badgeWin.Show();
+                // SizeToContent must re-measure after a hidden->visible flip,
+                // otherwise the window stays at its collapsed 1x1 size.
+                _badgeWin.UpdateLayout();
             }
-            // SizeToContent measures asynchronously: re-anchor after layout
-            // settles so ActualWidth is final (otherwise the pill sits at the
-            // wrong offset while its size is still 0).
+            // Re-anchor after layout settles so ActualWidth is final.
             _badgeWin.Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(SyncBadgePosition));
             SyncBadgePosition();
         }
 
-        /// <summary>Auto-hide the badge after `ms` (used for done/failed).</summary>
+        /// <summary>Auto-hide the badge after `ms` (used for done/failed).
+        /// Hides the WINDOW only — the badge content stays Visible so a later
+        /// Show() pops it up at its normal size (no collapsed 1x1 residue).</summary>
         private void ScheduleBadgeHide(int ms)
         {
             if (_badgeHideTimer == null)
@@ -683,7 +699,6 @@ namespace DshPetDesktop
                 _badgeHideTimer.Tick += (s2, e2) =>
                 {
                     _badgeHideTimer.Stop();
-                    if (_statusBadge != null) _statusBadge.Visibility = Visibility.Collapsed;
                     if (_badgeWin != null && _badgeWin.Visibility != Visibility.Hidden)
                         _badgeWin.Hide();
                 };
@@ -1129,13 +1144,49 @@ namespace DshPetDesktop
             else _tray.Icon = System.Drawing.SystemIcons.Application;
             _tray.Text = "DSH Controller + Pet";
 
-            // Left and right click both open the controller panel.
+            // Left/right single click: open the controller panel. Left
+            // double-click: open the WebUI directly.
+            long lastLeftUpTicks = 0;
             _tray.MouseUp += (s, e) =>
             {
-                if (e.Button == System.Windows.Forms.MouseButtons.Left
-                    || e.Button == System.Windows.Forms.MouseButtons.Right)
+                if (e.Button == System.Windows.Forms.MouseButtons.Right)
                 {
                     ShowControllerPanel(null);
+                }
+                else if (e.Button == System.Windows.Forms.MouseButtons.Left)
+                {
+                    long now = DateTime.Now.Ticks;
+                    long dblMs = System.Windows.Forms.SystemInformation.DoubleClickTime;
+                    if (now - lastLeftUpTicks < dblMs * TimeSpan.TicksPerMillisecond)
+                    {
+                        // Double-click: open the WebUI, swallow the second
+                        // click's single-click action.
+                        lastLeftUpTicks = 0;
+                        OnControllerOpen();
+                    }
+                    else
+                    {
+                        lastLeftUpTicks = now;
+                        // Defer the single-click action briefly; if a second
+                        // click arrives within the double-click window, the
+                        // deferred action is cancelled and WebUI opens instead.
+                        _tray.Tag = 1; // marker: single-click pending
+                        System.Threading.Timer timer = null;
+                        timer = new System.Threading.Timer(delegate
+                        {
+                            try
+                            {
+                                if (_tray != null && object.Equals(_tray.Tag, 1))
+                                {
+                                    _tray.Tag = 0;
+                                    System.Windows.Application.Current.Dispatcher.BeginInvoke(
+                                        new Action(delegate { ShowControllerPanel(null); }));
+                                }
+                            }
+                            catch { }
+                            if (timer != null) timer.Dispose();
+                        }, null, dblMs + 30, System.Threading.Timeout.Infinite);
+                    }
                 }
             };
 
@@ -1401,15 +1452,24 @@ namespace DshPetDesktop
                     AddRow(menu, colors, "\uE713", "配置...", null, true, ShowConfigDialog);
                     AddSeparator(menu, colors);
 
-                    // --- pet settings ---
-                    AddRow(menu, colors, null, "闲时动画 " + IdleIntervalLabel(), "触发间隔", true, () => ShowControllerPanel("idle"));
-                    AddRow(menu, colors, null, "尺寸 " + _sizePct + "%", "点击选择", true, () => ShowControllerPanel("size"));
-                    AddRow(menu, colors, null, "移动 " + (_moveEnabled ? "开" : "关"), "左右走路/跑步时移动", true, ToggleMove);
-                    AddRow(menu, colors, null, "移速 " + _moveSpeed + " px/s", "点击选择", true, () => ShowControllerPanel("speed"));
-                    AddRow(menu, colors, null, "鼠标穿透 " + (_clickThrough ? "开" : "关"), null, true, ToggleClickThrough);
-                    AddRow(menu, colors, null, "置顶 " + (Topmost ? "开" : "关"), null, true, () => { Topmost = !Topmost; SaveConfig(); });
-                    AddRow(menu, colors, null, "开机启动 " + (GetAutoStart() ? "开" : "关"), null, true, () => { SetAutoStart(!GetAutoStart()); });
-                    AddRow(menu, colors, null, _visible ? "隐藏宠物" : "显示宠物", null, true, () => { SetVisible(!_visible); SaveConfig(); });
+                    // --- pet settings (only while the pet is visible) ---
+                    if (_visible)
+                    {
+                        AddSeparator(menu, colors);
+                        AddRow(menu, colors, null, "闲时动画 " + IdleIntervalLabel(), "触发间隔", true, () => ShowControllerPanel("idle"));
+                        AddRow(menu, colors, null, "尺寸 " + _sizePct + "%", "点击选择", true, () => ShowControllerPanel("size"));
+                        AddRow(menu, colors, null, "移动 " + (_moveEnabled ? "开" : "关"), "左右走路/跑步时移动", true, ToggleMove);
+                        AddRow(menu, colors, null, "移速 " + _moveSpeed + " px/s", "点击选择", true, () => ShowControllerPanel("speed"));
+                        AddRow(menu, colors, null, "鼠标穿透 " + (_clickThrough ? "开" : "关"), null, true, ToggleClickThrough);
+                        AddRow(menu, colors, null, "置顶 " + (Topmost ? "开" : "关"), null, true, () => { Topmost = !Topmost; SaveConfig(); });
+                        AddRow(menu, colors, null, "开机启动 " + (GetAutoStart() ? "开" : "关"), null, true, () => { SetAutoStart(!GetAutoStart()); });
+                        AddRow(menu, colors, null, "隐藏宠物", null, true, () => { SetVisible(false); SaveConfig(); });
+                    }
+                    else
+                    {
+                        AddSeparator(menu, colors);
+                        AddRow(menu, colors, null, "显示宠物", null, true, () => { SetVisible(true); SaveConfig(); });
+                    }
                     AddSeparator(menu, colors);
 
                     AddRow(menu, colors, "\uE7E8", "退出", null, true, Quit);
@@ -1584,40 +1644,50 @@ namespace DshPetDesktop
                     menu.Items.Add(iPlay);
                     menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
                 }
-                var i5 = new System.Windows.Forms.ToolStripMenuItem("尺寸 " + _sizePct + "%");
-                i5.Click += (s2, e2) => CycleSize();
-                menu.Items.Add(i5);
-                var i5b = new System.Windows.Forms.ToolStripMenuItem("闲时动画 " + IdleIntervalLabel());
-                i5b.Click += (s2, e2) =>
+                if (!petOnly && !_visible)
                 {
-                    int idx = Array.IndexOf(IDLE_INTERVAL_OPTIONS, _idleIntervalMs / 1000);
-                    idx = (idx + 1) % IDLE_INTERVAL_OPTIONS.Length;
-                    SetIdleIntervalSec(IDLE_INTERVAL_OPTIONS[idx]);
-                };
-                menu.Items.Add(i5b);
-                var i6 = new System.Windows.Forms.ToolStripMenuItem("移动 " + (_moveEnabled ? "开" : "关"));
-                i6.Click += (s2, e2) => ToggleMove();
-                menu.Items.Add(i6);
-                var i7 = new System.Windows.Forms.ToolStripMenuItem("移速 " + _moveSpeed + " px/s");
-                i7.Click += (s2, e2) =>
+                    // Pet hidden: only offer bringing it back.
+                    var iShow = new System.Windows.Forms.ToolStripMenuItem("显示宠物");
+                    iShow.Click += (s2, e2) => { SetVisible(true); SaveConfig(); };
+                    menu.Items.Add(iShow);
+                }
+                else
                 {
-                    int idx = Array.IndexOf(SPEED_OPTIONS, _moveSpeed);
-                    idx = (idx + 1) % SPEED_OPTIONS.Length;
-                    SetMoveSpeed(SPEED_OPTIONS[idx]);
-                };
-                menu.Items.Add(i7);
-                var i8 = new System.Windows.Forms.ToolStripMenuItem("鼠标穿透 " + (_clickThrough ? "开" : "关"));
-                i8.Click += (s2, e2) => ToggleClickThrough();
-                menu.Items.Add(i8);
-                var i9 = new System.Windows.Forms.ToolStripMenuItem("置顶 " + (Topmost ? "开" : "关"));
-                i9.Click += (s2, e2) => { Topmost = !Topmost; SaveConfig(); };
-                menu.Items.Add(i9);
-                var i10 = new System.Windows.Forms.ToolStripMenuItem("开机启动 " + (GetAutoStart() ? "开" : "关"));
-                i10.Click += (s2, e2) => SetAutoStart(!GetAutoStart());
-                menu.Items.Add(i10);
-                var i11 = new System.Windows.Forms.ToolStripMenuItem(_visible ? "隐藏宠物" : "显示宠物");
-                i11.Click += (s2, e2) => { SetVisible(!_visible); SaveConfig(); };
-                menu.Items.Add(i11);
+                    var i5 = new System.Windows.Forms.ToolStripMenuItem("尺寸 " + _sizePct + "%");
+                    i5.Click += (s2, e2) => CycleSize();
+                    menu.Items.Add(i5);
+                    var i5b = new System.Windows.Forms.ToolStripMenuItem("闲时动画 " + IdleIntervalLabel());
+                    i5b.Click += (s2, e2) =>
+                    {
+                        int idx = Array.IndexOf(IDLE_INTERVAL_OPTIONS, _idleIntervalMs / 1000);
+                        idx = (idx + 1) % IDLE_INTERVAL_OPTIONS.Length;
+                        SetIdleIntervalSec(IDLE_INTERVAL_OPTIONS[idx]);
+                    };
+                    menu.Items.Add(i5b);
+                    var i6 = new System.Windows.Forms.ToolStripMenuItem("移动 " + (_moveEnabled ? "开" : "关"));
+                    i6.Click += (s2, e2) => ToggleMove();
+                    menu.Items.Add(i6);
+                    var i7 = new System.Windows.Forms.ToolStripMenuItem("移速 " + _moveSpeed + " px/s");
+                    i7.Click += (s2, e2) =>
+                    {
+                        int idx = Array.IndexOf(SPEED_OPTIONS, _moveSpeed);
+                        idx = (idx + 1) % SPEED_OPTIONS.Length;
+                        SetMoveSpeed(SPEED_OPTIONS[idx]);
+                    };
+                    menu.Items.Add(i7);
+                    var i8 = new System.Windows.Forms.ToolStripMenuItem("鼠标穿透 " + (_clickThrough ? "开" : "关"));
+                    i8.Click += (s2, e2) => ToggleClickThrough();
+                    menu.Items.Add(i8);
+                    var i9 = new System.Windows.Forms.ToolStripMenuItem("置顶 " + (Topmost ? "开" : "关"));
+                    i9.Click += (s2, e2) => { Topmost = !Topmost; SaveConfig(); };
+                    menu.Items.Add(i9);
+                    var i10 = new System.Windows.Forms.ToolStripMenuItem("开机启动 " + (GetAutoStart() ? "开" : "关"));
+                    i10.Click += (s2, e2) => SetAutoStart(!GetAutoStart());
+                    menu.Items.Add(i10);
+                    var i11 = new System.Windows.Forms.ToolStripMenuItem(_visible ? "隐藏宠物" : "显示宠物");
+                    i11.Click += (s2, e2) => { SetVisible(!_visible); SaveConfig(); };
+                    menu.Items.Add(i11);
+                }
                 if (!petOnly)
                 {
                     menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
@@ -1774,6 +1844,15 @@ namespace DshPetDesktop
             try
             {
                 _http = new TcpListener(IPAddress.Loopback, HTTP_PORT);
+                // Never let child processes inherit this socket handle: the DSH
+                // service is launched with a redirected stdio child, which
+                // would otherwise inherit the listener and keep port 18787
+                // bound forever after this process exits (orphan LISTENING).
+                try
+                {
+                    SetHandleInformation(_http.Server.Handle, HANDLE_FLAG_INHERIT, 0);
+                }
+                catch { }
                 _http.Start();
                 var thread = new Thread(HttpLoop);
                 thread.IsBackground = true;
@@ -1893,6 +1972,168 @@ namespace DshPetDesktop
             return null;
         }
 
+        /// <summary>
+        /// Apply one web-pet state sample (from a /play push or the DSH host
+        /// poll): update the badge phase/label, then play the animation with
+        /// idle-family throttling so the web pet's idle rotations don't fight
+        /// the local idle schedule.
+        /// </summary>
+        private void ApplyWebState(int row, string phase, string label)
+        {
+            // Badge phase/label (a missing phase keeps the previous one).
+            if (phase != null && phase.Length > 0)
+            {
+                _dshPhase = phase;
+                _dshLabel = label ?? "";
+                UpdateStatusBadge(GetListenerPids());
+            }
+            // Idle-family tracks (idle/waving/waiting) are THROTTLED — the
+            // desktop pet keeps its base idle and only performs occasional
+            // idle animations on the user's configured interval, so the web
+            // pet's idle rotations must not force a fresh animation every
+            // slice. Task tracks (running / review / jumping / failed) play
+            // immediately. A pushed `idle` while an idle-perform is running
+            // settles the pet back to base idle.
+            if (row == 0 || row == 3 || row == 6)
+            {
+                if (_performingIdle && row == BASE_IDLE_ROW)
+                {
+                    _performingIdle = false;
+                    PlayTrack(BASE_IDLE_ROW);
+                }
+                else if (!_performingIdle && _track.Row != BASE_IDLE_ROW)
+                {
+                    PlayTrack(BASE_IDLE_ROW);
+                }
+                // else: already idle or performing - keep the local schedule.
+            }
+            else
+            {
+                PlayTrack(row);
+            }
+        }
+
+        /// <summary>
+        /// Event-driven DSH sync: subscribe to the host's /api/pet/stream SSE
+        /// endpoint, which pushes every projected session activity the moment
+        /// it happens (no polling, independent of browser tabs). Falls back to
+        /// a 2 s poll of /api/pet/state while the stream is unavailable, and
+        /// reconnects automatically.
+        /// </summary>
+        private void StartDshPoll()
+        {
+            var t = new Thread(delegate () { DshSyncLoop(); });
+            t.IsBackground = true;
+            t.Name = "pet-dsh-sync";
+            t.Start();
+        }
+
+        private void DshSyncLoop()
+        {
+            while (!_httpStop)
+            {
+                // Prefer the event stream; on any failure fall back to one
+                // poll, then back off before retrying the stream. Every path
+                // sleeps at least ~1 s so a missing endpoint (404) or a
+                // flapping server can never turn this into a busy loop.
+                bool streamOk = TryDshSse();
+                if (streamOk)
+                {
+                    // Stream ended cleanly (server closed): brief pause, then
+                    // reconnect immediately.
+                    for (int i = 0; i < 5 && !_httpStop; i++) Thread.Sleep(200); // ~1 s
+                    continue;
+                }
+                // Stream failed (endpoint missing / server down): one poll for
+                // continuity, then a longer pause before retrying the stream.
+                TryDshPollOnce();
+                for (int i = 0; i < 10 && !_httpStop; i++) Thread.Sleep(200); // ~2 s
+            }
+        }
+
+        /// <summary>One blocking SSE read: returns when the stream ends.</summary>
+        private bool TryDshSse()
+        {
+            try
+            {
+                string url = _ctlWebUrl.TrimEnd('/') + "/api/pet/stream";
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.Timeout = 3000;
+                req.ReadWriteTimeout = 60000;
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                using (StreamReader reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                {
+                    // SSE frames: "data: {json}\n\n". Blocking read until EOF.
+                    StringBuilder frame = new StringBuilder();
+                    int ch;
+                    while (!_httpStop && (ch = reader.Read()) >= 0)
+                    {
+                        if (ch == '\n')
+                        {
+                            string line = frame.ToString().TrimEnd('\r');
+                            frame.Length = 0;
+                            if (line.StartsWith("data:"))
+                            {
+                                string payload = line.Substring(5).Trim();
+                                if (payload.Length > 0 && payload[0] == '{')
+                                {
+                                    ConsumeDshJson(payload);
+                                }
+                            }
+                            // blank line = end of event; next lines are a new frame
+                        }
+                        else
+                        {
+                            frame.Append((char)ch);
+                        }
+                    }
+                }
+                return true; // stream ended cleanly (server closed): reconnect
+            }
+            catch
+            {
+                return false; // stream failed: fall back to polling
+            }
+        }
+
+        /// <summary>One snapshot poll (fallback while the stream is down).</summary>
+        private bool TryDshPollOnce()
+        {
+            try
+            {
+                string url = _ctlWebUrl.TrimEnd('/') + "/api/pet/state";
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.Timeout = 2000;
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                using (StreamReader reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                {
+                    ConsumeDshJson(reader.ReadToEnd());
+                }
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>Apply one JSON state sample (SSE data or poll body).</summary>
+        private void ConsumeDshJson(string json)
+        {
+            string animation = ReadJsonString(json, "animation", "");
+            string phase = ReadJsonString(json, "phase", "");
+            string bubble = ReadJsonString(json, "bubble", "");
+            int row = animation.Length > 0 ? RowOfTrackName(animation) : -1;
+            if (row < 0) return;
+            int playRow = row;
+            string playPhase = phase;
+            string playLabel = bubble;
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                ApplyWebState(playRow, playPhase, playLabel);
+            }));
+        }
+
         private string Route(string path, string query, ref string status)
         {
             if (path == "/health")
@@ -1931,44 +2172,7 @@ namespace DshPetDesktop
                 string playLabel = label;
                 Dispatcher.BeginInvoke(new Action(delegate
                 {
-                    // Track the pushed DSH activity phase so the badge shows
-                    // thinking / waiting / done / failed / ... (not just a
-                    // green dot). A missing phase keeps the previous one.
-                    if (playPhase != null && playPhase.Length > 0)
-                    {
-                        _dshPhase = playPhase;
-                        _dshLabel = playLabel ?? "";
-                        UpdateStatusBadge(GetListenerPids());
-                    }
-                    // Web-pet push: idle-family tracks (idle/waving/waiting)
-                    // are THROTTLED — the desktop pet keeps its base idle and
-                    // only performs occasional idle animations on the user's
-                    // configured interval, so the web pet's 8s idle rotations
-                    // must not force a fresh animation every slice. Task
-                    // tracks (running / review / jumping / failed) still play
-                    // immediately. A pushed `idle` while an idle-perform is
-                    // running settles the pet back to base idle.
-                    if (playRow == 0 || playRow == 3 || playRow == 6)
-                    {
-                        if (_performingIdle && playRow == BASE_IDLE_ROW)
-                        {
-                            _performingIdle = false;
-                            PlayTrack(BASE_IDLE_ROW);
-                        }
-                        else if (!_performingIdle && _track.Row != BASE_IDLE_ROW)
-                        {
-                            // Task animation running; a pushed idle-family
-                            // track means the session went quiet. Fall back to
-                            // base idle (ignore the pushed waving/waiting).
-                            PlayTrack(BASE_IDLE_ROW);
-                        }
-                        // else: already idle or performing - keep the local
-                        // interval schedule, ignore the push.
-                    }
-                    else
-                    {
-                        PlayTrack(playRow);
-                    }
+                    ApplyWebState(playRow, playPhase, playLabel);
                 }));
                 return "{\"ok\":true,\"track\":\"" + TrackNameOfRow(row) + "\"}";
             }
