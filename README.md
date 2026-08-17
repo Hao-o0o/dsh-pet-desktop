@@ -115,6 +115,8 @@ csc.exe /nologo /target:winexe /codepage:65001 /optimize+ /out:Pet.exe `
 程序启动时会自动逐行检测每行实际帧数（跳过透明尾帧），
 `TRACKS` 帧数会按检测结果自动裁剪。
 
-素材来源：petdex.dev（misaka-mikoto-premium）。
+**素材说明**：仓库不随附宠物精灵图——`misaka.png` 为第三方素材
+（petdex.dev 的 misaka-mikoto-premium，角色版权归原作者所有），请自行
+获取并放置于程序目录后使用；也可用任意自备精灵表替换。
 DSH 状态图标来源：`Workshop\resources\dscfgon.ico` / `dscfgoff.ico`
 （已复制到本目录 `resources\`）。
